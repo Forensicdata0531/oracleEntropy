@@ -1,38 +1,120 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
-#include "block.hpp"
-#include <iostream>
-#include <vector>
-#include <algorithm>
-#include <cstring>
-#include <simd/simd.h>  // for simd_uint4
+#import <atomic>
+#import <iostream>
+#import <vector>
+#import "block.hpp"  // For BlockHeader
 
-// Forward declaration for SHA256 (you must provide a real implementation)
-void sha256(const uint8_t* data, size_t len, uint8_t* outHash);
+class MetalMiner {
+private:
+    id<MTLDevice> device;
+    id<MTLCommandQueue> commandQueue;
+    id<MTLComputePipelineState> pipelineState;
+    id<MTLBuffer> headerBuffer;
+    id<MTLBuffer> targetBuffer;
+    id<MTLBuffer> nonceBaseBuffer;
+    id<MTLBuffer> resultNonceBuffer;
+    id<MTLBuffer> resultHashesBuffer;
 
-// Serialize header to 80 bytes (little-endian as per Bitcoin spec)
-std::vector<uint8_t> serializeHeader80(const BlockHeader& header) {
-    std::vector<uint8_t> out;
+    uint32_t nonceBase;
 
-    auto appendLE32 = [&](uint32_t val) {
-        for (size_t i = 0; i < 4; ++i)
-            out.push_back((val >> (8 * i)) & 0xff);
-    };
+    static constexpr size_t THREADS_PER_GRID = 131072;
+    static constexpr size_t HASHES_PER_THREAD = 2;
 
-    auto appendReversed = [&](const std::array<uint8_t,32>& v) {
-        for (int i = 31; i >= 0; --i)
-            out.push_back(v[i]);
-    };
+public:
+    MetalMiner(id<MTLDevice> dev, id<MTLLibrary> library) : device(dev), nonceBase(0) {
+        commandQueue = [device newCommandQueue];
 
-    appendLE32(header.version);
-    appendReversed(header.prevBlockHash);
-    appendReversed(header.merkleRoot);
-    appendLE32(header.timestamp);
-    appendLE32(header.bits);
-    appendLE32(header.nonce);
+        NSError *error = nil;
+        id<MTLFunction> function = [library newFunctionWithName:@"mineKernel"];
+        pipelineState = [device newComputePipelineStateWithFunction:function error:&error];
+        if (error) {
+            std::cerr << "❌ Failed to create compute pipeline state: " << error.localizedDescription.UTF8String << "\n";
+            exit(1);
+        }
 
-    return out;
-}
+        headerBuffer = [device newBufferWithLength:80 options:MTLResourceStorageModeShared];
+        targetBuffer = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+        nonceBaseBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        resultNonceBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        resultHashesBuffer = [device newBufferWithLength:THREADS_PER_GRID * HASHES_PER_THREAD * 32 options:MTLResourceStorageModeShared];
+
+        resetResultNonce();
+    }
+
+    void resetResultNonce() {
+        uint32_t zero = 0;
+        memcpy(resultNonceBuffer.contents, &zero, sizeof(uint32_t));
+        nonceBase = 0;
+    }
+
+    void setHeader(const uint8_t header[80]) {
+        memcpy(headerBuffer.contents, header, 80);
+    }
+
+    void setTarget(const uint8_t target[32]) {
+        memcpy(targetBuffer.contents, target, 32);
+    }
+
+    void setNonceBase(uint32_t base) {
+        nonceBase = base;
+        memcpy(nonceBaseBuffer.contents, &nonceBase, sizeof(uint32_t));
+    }
+
+    bool mine(uint32_t& validNonce, std::vector<uint8_t>& validHash, uint64_t& hashesTried) {
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:pipelineState];
+        [encoder setBuffer:headerBuffer offset:0 atIndex:0];
+        [encoder setBuffer:targetBuffer offset:0 atIndex:1];
+        [encoder setBuffer:nonceBaseBuffer offset:0 atIndex:2];
+        [encoder setBuffer:resultNonceBuffer offset:0 atIndex:3];
+        [encoder setBuffer:resultHashesBuffer offset:0 atIndex:4];
+
+        MTLSize gridSize = MTLSizeMake(THREADS_PER_GRID, 1, 1);
+        NSUInteger threadGroupSize = pipelineState.maxTotalThreadsPerThreadgroup;
+        if (threadGroupSize > THREADS_PER_GRID) threadGroupSize = THREADS_PER_GRID;
+        MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
+
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            std::cerr << "❌ GPU error: " << commandBuffer.error.localizedDescription.UTF8String << "\n";
+            return false;
+        }
+
+        uint32_t foundNonce = *(uint32_t*)resultNonceBuffer.contents;
+        hashesTried = static_cast<uint64_t>(THREADS_PER_GRID) * HASHES_PER_THREAD;
+
+        if (foundNonce != 0) {
+            validNonce = foundNonce;
+            uint32_t nonceOffset = foundNonce - nonceBase;
+            uint32_t index = nonceOffset / HASHES_PER_THREAD;
+            uint32_t offset = (nonceOffset % HASHES_PER_THREAD) * 32;
+
+            if (index < THREADS_PER_GRID) {
+                uint8_t* basePtr = (uint8_t*)resultHashesBuffer.contents + index * HASHES_PER_THREAD * 32 + offset;
+                validHash.assign(basePtr, basePtr + 32);
+            } else {
+                std::cerr << "⚠️ Invalid GPU nonce index.\n";
+                return false;
+            }
+
+            uint32_t zero = 0;
+            memcpy(resultNonceBuffer.contents, &zero, sizeof(uint32_t));
+            return true;
+        }
+
+        nonceBase += hashesTried;
+        memcpy(nonceBaseBuffer.contents, &nonceBase, sizeof(uint32_t));
+        return false;
+    }
+};
 
 bool metalMineBlock(
     const BlockHeader& header,
@@ -42,113 +124,57 @@ bool metalMineBlock(
     std::vector<uint8_t>& validHash,
     uint64_t& totalHashesTried)
 {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (!device) {
-        std::cerr << "Metal not supported on this device." << std::endl;
-        return false;
+    static MetalMiner* miner = nullptr;
+
+    if (!miner) {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            std::cerr << "❌ Metal device not found.\n";
+            return false;
+        }
+
+        NSError *error = nil;
+        NSURL *libURL = [NSURL fileURLWithPath:@"/Users/jacewheeler/Desktop/RestoredMetalMiner/build/mineKernel.metallib"];
+        id<MTLLibrary> library = [device newLibraryWithURL:libURL error:&error];
+        if (!library) {
+            std::cerr << "❌ Failed to load Metal library: " << (error ? error.localizedDescription.UTF8String : "Unknown error") << "\n";
+            return false;
+        }
+
+        miner = new MetalMiner(device, library);
     }
 
-    NSError* error = nil;
-    id<MTLLibrary> library = [device newDefaultLibrary];
-    if (!library) {
-        std::cerr << "Failed to create Metal library." << std::endl;
-        return false;
-    }
+    uint8_t headerBytes[80];
+    memset(headerBytes, 0, 80);
 
-    id<MTLFunction> kernelFunction = [library newFunctionWithName:@"mineKernel"];
-    if (!kernelFunction) {
-        std::cerr << "Failed to load Metal kernel function." << std::endl;
-        return false;
-    }
+    // Pack block header into little-endian
+    headerBytes[0] = header.version & 0xff;
+    headerBytes[1] = (header.version >> 8) & 0xff;
+    headerBytes[2] = (header.version >> 16) & 0xff;
+    headerBytes[3] = (header.version >> 24) & 0xff;
 
-    id<MTLComputePipelineState> pipelineState = [device newComputePipelineStateWithFunction:kernelFunction error:&error];
-    if (!pipelineState) {
-        std::cerr << "Failed to create pipeline state: " << [[error localizedDescription] UTF8String] << std::endl;
-        return false;
-    }
+    memcpy(headerBytes + 4, header.prevBlockHash.data(), 32);
+    memcpy(headerBytes + 36, header.merkleRoot.data(), 32);
 
-    id<MTLCommandQueue> commandQueue = [device newCommandQueue];
-    if (!commandQueue) {
-        std::cerr << "Failed to create Metal command queue." << std::endl;
-        return false;
-    }
+    headerBytes[68] = header.timestamp & 0xff;
+    headerBytes[69] = (header.timestamp >> 8) & 0xff;
+    headerBytes[70] = (header.timestamp >> 16) & 0xff;
+    headerBytes[71] = (header.timestamp >> 24) & 0xff;
 
-    // Step 1: Serialize Block Header
-    std::vector<uint8_t> headerData = serializeHeader80(header);
-    if (headerData.size() != 80) {
-        std::cerr << "Serialized header is not 80 bytes." << std::endl;
-        return false;
-    }
+    headerBytes[72] = header.bits & 0xff;
+    headerBytes[73] = (header.bits >> 8) & 0xff;
+    headerBytes[74] = (header.bits >> 16) & 0xff;
+    headerBytes[75] = (header.bits >> 24) & 0xff;
 
-    const uint32_t threads = 65536;  // tune for device
-    totalHashesTried = threads;
-    uint32_t nonceBase = initialNonceBase;
+    // Nonce initialized to 0 (updated inside GPU)
+    headerBytes[76] = 0;
+    headerBytes[77] = 0;
+    headerBytes[78] = 0;
+    headerBytes[79] = 0;
 
-    // Step 2: Prepare Buffers
+    miner->setHeader(headerBytes);
+    miner->setTarget(target.data());
+    miner->setNonceBase(initialNonceBase);
 
-    // Midstate is SHA256 of first 64 bytes (first SHA256)
-    uint8_t midstateBytes[32];
-    sha256(headerData.data(), 64, midstateBytes); // Provide your SHA256 implementation
-
-    // Convert midstate bytes to simd_uint4 (4x uint32_t = 16 bytes, so 32 bytes = 2 simd_uint4)
-    simd_uint4 midstateSimd[2];
-    for (int i = 0; i < 2; ++i) {
-        uint32_t* p = (uint32_t*)(midstateBytes + i * 16);
-        midstateSimd[i] = simd_make_uint4(p[0], p[1], p[2], p[3]);
-    }
-
-    id<MTLBuffer> midstateBuffer = [device newBufferWithBytes:midstateSimd length:sizeof(midstateSimd) options:MTLResourceStorageModeShared];
-
-    // Tail buffer is last 16 bytes of header (timestamp + bits + nonce + padding)
-    // Pack as simd_uint4 for alignment
-    simd_uint4 tailSimd;
-    memcpy(&tailSimd, headerData.data() + 64, 16);
-    id<MTLBuffer> tailBuffer = [device newBufferWithBytes:&tailSimd length:sizeof(tailSimd) options:MTLResourceStorageModeShared];
-
-    // Target buffer (difficulty target as 32 bytes)
-    id<MTLBuffer> targetBuffer = [device newBufferWithBytes:target.data() length:target.size() options:MTLResourceStorageModeShared];
-
-    // Buffer to receive result nonce if found
-    id<MTLBuffer> resultNonceBuf = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    memset(resultNonceBuf.contents, 0, sizeof(uint32_t));
-
-    // Buffer for base nonce input
-    id<MTLBuffer> nonceBaseBuf = [device newBufferWithBytes:&nonceBase length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-
-    // Buffer to store hashes found by threads (for validation/debugging)
-    id<MTLBuffer> resultHashes = [device newBufferWithLength:threads * 32 options:MTLResourceStorageModeShared];
-
-    // Prepare command buffer and encoder
-    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-
-    [encoder setComputePipelineState:pipelineState];
-    [encoder setBuffer:midstateBuffer offset:0 atIndex:0];
-    [encoder setBuffer:tailBuffer offset:0 atIndex:1];
-    [encoder setBuffer:targetBuffer offset:0 atIndex:2];
-    [encoder setBuffer:resultNonceBuf offset:0 atIndex:3];
-    [encoder setBuffer:nonceBaseBuf offset:0 atIndex:4];
-    [encoder setBuffer:resultHashes offset:0 atIndex:5];
-
-    MTLSize gridSize = MTLSizeMake(threads, 1, 1);
-    NSUInteger threadGroupSize = pipelineState.maxTotalThreadsPerThreadgroup;
-    if (threadGroupSize > threads) threadGroupSize = threads;
-    MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
-
-    [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-    [encoder endEncoding];
-    [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-
-    uint32_t foundNonce = *((uint32_t*)resultNonceBuf.contents);
-    if (foundNonce != 0) {
-        validNonce = foundNonce;
-        validHash.assign(
-            (uint8_t*)resultHashes.contents + (validNonce - nonceBase) * 32,
-            (uint8_t*)resultHashes.contents + (validNonce - nonceBase + 1) * 32
-        );
-        return true;
-    }
-
-    return false;
+    return miner->mine(validNonce, validHash, totalHashesTried);
 }

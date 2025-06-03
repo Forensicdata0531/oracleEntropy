@@ -27,7 +27,7 @@ struct BlockTemplate {
         BlockTemplate bt;
 
         if (!j.contains("version") || !j["version"].is_number_integer())
-            throw std::runtime_error("Missing or invalid 'version' in JSON: " + j.dump());
+            throw std::runtime_error("Missing or invalid 'version' in JSON");
 
         bt.version = j["version"].get<int>();
 

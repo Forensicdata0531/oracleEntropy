@@ -13,7 +13,7 @@ size_t RpcClient::writeCallback(void* contents, size_t size, size_t nmemb, std::
 
 json RpcClient::call(const std::string& method, const json& params) {
     CURL* curl = curl_easy_init();
-    if (!curl) throw std::runtime_error("Failed to init curl");
+    if (!curl) throw std::runtime_error("Failed to initialize curl");
 
     json requestJson = {
         {"jsonrpc", "1.0"},
@@ -40,28 +40,32 @@ json RpcClient::call(const std::string& method, const json& params) {
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         curl_easy_cleanup(curl);
-        throw std::runtime_error("Curl failed: " + std::string(curl_easy_strerror(res)));
+        throw std::runtime_error(std::string("Curl failed: ") + curl_easy_strerror(res));
     }
 
     curl_easy_cleanup(curl);
 
-    return json::parse(readBuffer);
+    try {
+        json response = json::parse(readBuffer);
+        return response;
+    } catch (const json::parse_error& e) {
+        throw std::runtime_error(std::string("Failed to parse JSON response: ") + e.what());
+    }
 }
 
 bool RpcClient::submitblock(const std::string& blockHex) {
-    // Construct a submitblock JSON-RPC call
     json requestJson = {
         {"jsonrpc", "1.0"},
         {"id", "submit"},
         {"method", "submitblock"},
-        {"params", { blockHex }}
+        {"params", {blockHex}}
     };
 
     std::string requestStr = requestJson.dump();
     std::string readBuffer;
 
     CURL* curl = curl_easy_init();
-    if (!curl) throw std::runtime_error("Failed to init curl");
+    if (!curl) throw std::runtime_error("Failed to initialize curl");
 
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -78,15 +82,18 @@ bool RpcClient::submitblock(const std::string& blockHex) {
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         curl_easy_cleanup(curl);
-        throw std::runtime_error("Curl failed: " + std::string(curl_easy_strerror(res)));
+        throw std::runtime_error(std::string("Curl failed: ") + curl_easy_strerror(res));
     }
 
     curl_easy_cleanup(curl);
 
-    // Parse the response; submitblock returns null if accepted
-    json response = json::parse(readBuffer);
-    if (response.contains("error") && response["error"].is_null()) {
-        return true;
+    try {
+        json response = json::parse(readBuffer);
+        if (response.contains("error") && response["error"].is_null()) {
+            return true;
+        }
+        return false;
+    } catch (const json::parse_error& e) {
+        throw std::runtime_error(std::string("Failed to parse JSON response: ") + e.what());
     }
-    return false;
 }
