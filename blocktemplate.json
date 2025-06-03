@@ -1,0 +1,16 @@
+{
+  "version": 536870912,
+  "previousblockhash": "0000000000000000000b4d0f1f45f20c5a0ea217e7ceae4d91e3dcb52c80b8f1",
+  "transactions": [
+    {
+      "data": "0100000001abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef000000006b483045022100b0bd7f88c43ab731e307a3ff4ff2b252f3cb8db0e8e8a8152938c6d7c1f7c17202202ee47932a9a9f2f8c55e1be5d4f61f1fc15f9ed5a556f28c8d08c64b12a3a8ea012103f45e8b3c8a6a6b09edeb55b0a69e62b0ccfbc9b8acbf5ad287eb2091c1a40d3dffffffff0140420f00000000001976a9145a8f2d3c7437eecdb4db87c15ec72a10aeb4a3fc88ac00000000",
+      "txid": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "fee": 1234
+    }
+  ],
+  "coinbasevalue": 625000000,
+  "bits": "170fffff",
+  "target": "0000000000000000000fffff0000000000000000000000000000000000000000",
+  "curtime": 1716722222,
+  "height": 847322
+}
