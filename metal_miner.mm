@@ -25,11 +25,11 @@ private:
     id<MTLBuffer> nonceBaseBuffer;
 
     uint32_t nonceBase;
-
-    static constexpr size_t THREADS_PER_GRID = 131072;
+    size_t threadCount;
 
 public:
-    MetalMiner(id<MTLDevice> dev, id<MTLLibrary> lib) : device(dev), nonceBase(0) {
+    MetalMiner(id<MTLDevice> dev, id<MTLLibrary> lib, size_t threads)
+        : device(dev), nonceBase(0), threadCount(threads) {
         commandQueue = [device newCommandQueue];
 
         NSError *error = nil;
@@ -40,11 +40,11 @@ public:
             exit(1);
         }
 
-        targetBuffer = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
-        resultNonceBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        debugCounterBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        resultHashesBuffer = [device newBufferWithLength:THREADS_PER_GRID * 32 options:MTLResourceStorageModeShared];
-        nonceBaseBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        targetBuffer        = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+        resultNonceBuffer   = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        resultHashesBuffer  = [device newBufferWithLength:threadCount * 32 options:MTLResourceStorageModeShared];
+        debugCounterBuffer  = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        nonceBaseBuffer     = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
     }
 
     void loadMidstateTailJSON(const std::string& path) {
@@ -57,40 +57,32 @@ public:
         nlohmann::json j;
         in >> j;
 
-        std::vector<uint8_t> midstates, suffixes;
+        std::vector<uint8_t> midstates;
+        std::vector<uint8_t> suffixes;
         for (const auto& obj : j) {
-            if (!obj.contains("midstate") || !obj.contains("tail")) {
-                logLine("[WARN] Skipping entry missing 'midstate' or 'tail'");
+            if (!obj.contains("midstate") || !obj.contains("tail"))
                 continue;
-            }
 
             std::string mid = obj["midstate"];
             std::string tail = obj["tail"];
-            for (size_t i = 0; i < mid.size(); i += 2)
+
+            for (size_t i = 0; i < 64; i += 2)
                 midstates.push_back((uint8_t)std::stoi(mid.substr(i, 2), nullptr, 16));
-            for (size_t i = 0; i < tail.size(); i += 2)
+            for (size_t i = 0; i < 24; i += 2)
                 suffixes.push_back((uint8_t)std::stoi(tail.substr(i, 2), nullptr, 16));
         }
 
-        if (midstates.size() != THREADS_PER_GRID * 32 || suffixes.size() != THREADS_PER_GRID * 12) {
-            logLine("[ERROR] Mismatch in JSON midstate/tail lengths.");
-            exit(1);
+        threadCount = midstates.size() / 32;
+        midstateBuffer = [device newBufferWithBytes:midstates.data() length:midstates.size() options:MTLResourceStorageModeShared];
+
+        suffix16Buffer = [device newBufferWithLength:threadCount * 16 options:MTLResourceStorageModeShared];
+        uint8_t* dst = (uint8_t*)suffix16Buffer.contents;
+        for (size_t i = 0; i < threadCount; ++i) {
+            memcpy(dst + i * 16, &suffixes[i * 12], 12);
+            memset(dst + i * 16 + 12, 0, 4);
         }
 
-        midstateBuffer = [device newBufferWithBytes:midstates.data()
-                                              length:midstates.size()
-                                             options:MTLResourceStorageModeShared];
-
-        suffix16Buffer = [device newBufferWithLength:THREADS_PER_GRID * 16
-                                              options:MTLResourceStorageModeShared];
-
-        uint8_t* suffix = (uint8_t*)suffix16Buffer.contents;
-        for (size_t i = 0; i < THREADS_PER_GRID; i++) {
-            memcpy(&suffix[i * 16], &suffixes[i * 12], 12);
-            memset(&suffix[i * 16 + 12], 0, 4);  // Room for nonce
-        }
-
-        logLine("[INFO] Loaded midstate/tail buffers.");
+        logLine("[INFO] Loaded " + std::to_string(threadCount) + " midstates.");
     }
 
     void setTarget(const uint8_t* targetLE) {
@@ -102,10 +94,11 @@ public:
         memcpy(nonceBaseBuffer.contents, &nonceBase, sizeof(uint32_t));
     }
 
-    bool mine(uint32_t& foundNonce, std::vector<uint8_t>& foundHash, std::vector<uint8_t>& sampleHash, uint64_t& hashesTried) {
+    bool mine(uint32_t& foundNonce, std::vector<uint8_t>& foundHash,
+              std::vector<uint8_t>& sampleHash, uint64_t& hashesTried) {
         memset(resultNonceBuffer.contents, 0, sizeof(uint32_t));
+        memset(resultHashesBuffer.contents, 0, threadCount * 32);
         memset(debugCounterBuffer.contents, 0, sizeof(uint32_t));
-        memset(resultHashesBuffer.contents, 0, THREADS_PER_GRID * 32);
 
         id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
@@ -120,29 +113,28 @@ public:
         [encoder setBuffer:nonceBaseBuffer offset:0 atIndex:6];
 
         NSUInteger threadGroupSize = pipelineState.maxTotalThreadsPerThreadgroup;
-        NSUInteger numThreads = THREADS_PER_GRID;
-
-        [encoder dispatchThreads:MTLSizeMake(numThreads, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
+        MTLSize grid = MTLSizeMake(threadCount, 1, 1);
+        MTLSize tg = MTLSizeMake(std::min((size_t)threadGroupSize, threadCount), 1, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
         [encoder endEncoding];
 
         [cmd commit];
         [cmd waitUntilCompleted];
 
-        hashesTried = THREADS_PER_GRID;
+        hashesTried = threadCount;
 
         uint32_t nonce = *(uint32_t*)resultNonceBuffer.contents;
         sampleHash.assign((uint8_t*)resultHashesBuffer.contents, (uint8_t*)resultHashesBuffer.contents + 32);
 
         if (nonce != 0) {
-            uint32_t offset = (nonce - nonceBase) * 32;
+            size_t offset = (nonce - nonceBase) * 32;
             foundNonce = nonce;
             uint8_t* ptr = (uint8_t*)resultHashesBuffer.contents + offset;
             foundHash.assign(ptr, ptr + 32);
             return true;
         }
 
-        nonceBase += THREADS_PER_GRID;
+        nonceBase += threadCount;
         memcpy(nonceBaseBuffer.contents, &nonceBase, sizeof(uint32_t));
         return false;
     }
@@ -169,7 +161,7 @@ bool metalMineBlock(
             return false;
         }
 
-        miner = new MetalMiner(dev, lib);
+        miner = new MetalMiner(dev, lib, 131072);
         miner->loadMidstateTailJSON("oracle/top_midstates.json");
     }
 

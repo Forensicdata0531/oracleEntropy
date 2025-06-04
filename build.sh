@@ -6,6 +6,7 @@ rm -rf build
 mkdir -p build
 
 echo "🚧 Compiling Metal shader..."
+# Change path here to just mineKernel.metal (no ../)
 xcrun -sdk macosx metal -c mineKernel.metal -o mineKernel.air
 xcrun -sdk macosx metallib mineKernel.air -o mineKernel.metallib
 echo "✅ Metal shader compiled successfully."
@@ -18,6 +19,7 @@ SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
 CXX=clang++
 OBJCXX=clang++
 
+# Change include path to just '.' instead of '..'
 INCLUDE_FLAGS="-I. -I/opt/homebrew/include -I$OPENSSL_INCLUDE_DIR"
 BASE_CXXFLAGS="-std=c++20 -Wall -Wextra -g -isysroot $SDK_PATH $INCLUDE_FLAGS"
 
@@ -25,6 +27,7 @@ BASE_LDFLAGS="-L$OPENSSL_LIB_DIR -lssl -lcrypto -framework Foundation -framework
 OPT_FLAGS="-O3 -march=native"
 
 echo "🔧 Compiling source files..."
+# Fix all compile commands to point to current dir files (no ../)
 $CXX $BASE_CXXFLAGS -c utils.cpp -o build/utils.o
 $CXX $BASE_CXXFLAGS -c rpc.cpp -o build/rpc.o
 $CXX $BASE_CXXFLAGS -c sha256_compress.cpp -o build/sha256_compress.o
@@ -42,7 +45,7 @@ $CXX $BASE_CXXFLAGS -c oracle/oracle_table.cpp -o build/oracle_table.o
 echo "🧩 Linking full miner..."
 $CXX build/utils.o build/rpc.o build/sha256_compress.o build/block_utils.o build/metal_miner.o build/metal_ui.o build/metal_ui_mm.o build/main.o \
 build/sha256_wrapper.o build/entropy_metrics.o build/oracle_table.o \
-$BASE_LDFLAGS -o ./MetalMiner
+$BASE_LDFLAGS -o ../MetalMiner
 echo "✅ Build complete for MetalMiner."
 
 echo "📦 Building oracle_dispatcher tool..."
