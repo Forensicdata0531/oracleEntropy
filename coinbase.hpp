@@ -4,25 +4,20 @@
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
-#include "utils.hpp"
 
 // Base58 alphabet for legacy decoding (unused here, for reference)
 static const std::string BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 // Bech32 decoding (minimal; assumes valid bc1 address)
-std::vector<uint8_t> bech32Decode(const std::string& addr) {
+inline std::vector<uint8_t> bech32Decode(const std::string& addr) {
     if (addr.substr(0, 3) != "bc1") {
         throw std::runtime_error("Only bc1 Bech32 addresses supported");
     }
 
-    // Simplified decoder for P2WPKH: strip HRP, verify length
-    // Should be 42 chars long (bc1 + 39), 20-byte hash = 40 hex chars
     if (addr.length() < 42)
         throw std::runtime_error("Bech32 address too short");
 
-    // Use libbitcoin or real bech32 decoder in production.
-    // For now, hardcode the hash160 of the given address.
-    // bc1qgj6au67l9n5rjnwsm48s64ermf94jfm2r4mmk7 =>
+    // Hardcoded example for your specific address (replace or implement full decoder)
     return {
         0xd1, 0xe7, 0x75, 0x71, 0xa3, 0x46, 0x63, 0x8a, 0x87, 0x9b,
         0x79, 0x2f, 0x73, 0x55, 0x62, 0xe8, 0x66, 0xb3, 0x6a, 0x66
@@ -30,7 +25,7 @@ std::vector<uint8_t> bech32Decode(const std::string& addr) {
 }
 
 // Create coinbase TX paying 3.125 BTC to Bech32 P2WPKH address
-std::string createCoinbaseTx(int blockHeight, const std::string& bech32Address, const std::string& extraNonceHex = "00000000") {
+inline std::string createCoinbaseTx(int blockHeight, const std::string& bech32Address, const std::string& extraNonceHex = "00000000") {
     std::ostringstream tx;
 
     // Version

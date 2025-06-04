@@ -4,8 +4,10 @@
 #include <array>
 #include <mutex>
 #include <chrono>
+#include <vector>
+#include <deque>
 
-// Forward declaration (no implementation here!)
+// Forward declaration
 std::string formatUptime(std::chrono::steady_clock::time_point start);
 
 struct MiningStats {
@@ -22,6 +24,29 @@ struct MiningStats {
 
     std::atomic<std::chrono::steady_clock::time_point> startTime;
     std::mutex mutex;
+};
+
+// Ring buffer logger for UI window
+class RingLog {
+    std::deque<std::string> lines;
+    size_t max;
+    std::mutex mtx;
+
+public:
+    RingLog(size_t maxLines = 500) : max(maxLines) {}
+
+    void push(const std::string& line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        lines.push_back(line);
+        if (lines.size() > max)
+            lines.pop_front();
+    }
+
+    std::vector<std::string> getLines(size_t n) {
+        std::lock_guard<std::mutex> lock(mtx);
+        size_t start = lines.size() > n ? lines.size() - n : 0;
+        return std::vector<std::string>(lines.begin() + start, lines.end());
+    }
 };
 
 void updateCursesUI(MiningStats& stats);

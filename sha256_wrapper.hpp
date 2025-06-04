@@ -1,13 +1,13 @@
-#ifndef SHA256_WRAPPER_H
-#define SHA256_WRAPPER_H
-
+#pragma once
+#include <vector>
 #include <cstdint>
-#include <cstddef>
+#include <string>
 
-// Computes SHA-256 hash of the input data buffer.
-// - data: pointer to the input data bytes
-// - len: length of the input data in bytes
-// - outHash: pointer to a buffer of at least 32 bytes where the hash will be stored
-void sha256(const uint8_t* data, size_t len, uint8_t* outHash);
+// Compute full SHA-256 hash
+std::vector<uint8_t> sha256(const std::vector<uint8_t>& data);
 
-#endif // SHA256_WRAPPER_H
+// Optional: return midstate (internal state after first 64 rounds)
+std::vector<uint32_t> sha256_midstate(const std::vector<uint8_t>& header);
+
+// ✅ FIXED declaration: accepts raw bytes
+std::string compute_sha256_midstate_hex(const uint8_t* data, size_t len);

@@ -1,7 +1,9 @@
 #include "block_utils.hpp"
+#include "coinbase.hpp" // Use implementations from here
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
+#include <iomanip>
 
 using json = nlohmann::json;
 
@@ -45,3 +47,36 @@ std::array<uint8_t, 80> serializeBlockHeader(const BlockHeader& h) {
     writeLE(out.data() + 76, h.nonce);
     return out;
 }
+
+std::string createFullBlockHex(const BlockHeader& header, uint32_t validIndex,
+                               const std::string& coinbaseHex,
+                               const nlohmann::json& transactions) {
+    BlockHeader finalHeader = header;
+    finalHeader.nonce = validIndex;
+
+    std::ostringstream blockHex;
+    auto headerBytes = serializeBlockHeader(finalHeader);
+    for (uint8_t b : headerBytes)
+        blockHex << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+
+    // Transaction count (varint encoding - simple version)
+    size_t txCount = transactions.size() + 1;
+    if (txCount < 0xfd) {
+        blockHex << std::hex << std::setw(2) << std::setfill('0') << txCount;
+    } else {
+        throw std::runtime_error("Too many transactions for simple block writer");
+    }
+
+    // Coinbase transaction
+    blockHex << coinbaseHex;
+
+    // Additional transactions
+    for (const auto& tx : transactions) {
+        blockHex << tx["data"].get<std::string>();
+    }
+
+    return blockHex.str();
+}
+
+// NO definitions of createCoinbaseTx or bech32Decode here!
+// They live in coinbase.hpp and are linked accordingly.

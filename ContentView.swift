@@ -129,7 +129,7 @@ func runMiner(with template: BitcoinBlockTemplate) {
                         var nonceStart: UInt32 = 0
                         var extranonce: UInt32 = 0
                         let noNonceFound: UInt32 = 0xFFFFFFFF
-                        let nonceBatchSize = 1_048_576
+                        let nonceBatchSize = 262_144
                         
                         miningLoop: while true {
                             // Reset the nonce buffer to indicate no nonce found yet
