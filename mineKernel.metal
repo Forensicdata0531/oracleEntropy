@@ -26,14 +26,15 @@ inline simd::uint2 rotr(simd::uint2 x, uint n) {
 
 inline void prepare_block(device const uint8_t* header80, uint32_t nonce0, uint32_t nonce1,
                           thread simd::uint2* block) {
-    uint8_t buf0[80] = {0};
-    uint8_t buf1[80] = {0};
+    uint8_t buf0[80];
+    uint8_t buf1[80];
 
     for (uint i = 0; i < 76; i++) {
         buf0[i] = header80[i];
         buf1[i] = header80[i];
     }
 
+    // Insert nonce bytes little endian
     buf0[76] = (nonce0 >> 0) & 0xff;
     buf0[77] = (nonce0 >> 8) & 0xff;
     buf0[78] = (nonce0 >> 16) & 0xff;
@@ -101,7 +102,6 @@ inline void sha256_double(thread simd::uint2* block, thread simd::uint2* digest)
 
     sha256_compress(w, digest);
 
-    // Serialize each lane and prepare second block
     thread uint8_t inter[2][32];
     for (uint i = 0; i < 8; i++) {
         uint32_t lo = digest[i][0];
@@ -117,14 +117,6 @@ inline void sha256_double(thread simd::uint2* block, thread simd::uint2* digest)
         inter[1][i*4+3] = (hi >> 0)  & 0xff;
     }
 
-    // Build new 64-byte padded blocks
-    for (uint i = 0; i < 8; i++) {
-        uint32_t w0 = (uint32_t(inter[0][i*4+0]) << 24) | (uint32_t(inter[0][i*4+1]) << 16) |
-                      (uint32_t(inter[0][i*4+2]) << 8)  | (uint32_t(inter[0][i*4+3]));
-        uint32_t w1 = (uint32_t(inter[1][i*4+0]) << 24) | (uint32_t(inter[1][i*4+1]) << 16) |
-                      (uint32_t(inter[1][i*4+2]) << 8)  | (uint32_t(inter[1][i*4+3]));
-        block[i] = simd::uint2(w0, w1);
-    }
     block[8] = simd::uint2(0x80000000);
     for (uint i = 9; i < 15; i++) block[i] = simd::uint2(0);
     block[15] = simd::uint2(256); // 32 bytes = 256 bits
@@ -150,7 +142,7 @@ inline void output_hash(const thread simd::uint2* digest, thread uint8_t* hash, 
 }
 
 inline bool check_target(thread const uint8_t* hash, device const uint8_t* target) {
-    for (uint i = 0; i < 32; i++) {
+    for (int i = 31; i >= 0; i--) {
         if (hash[i] < target[i]) return true;
         if (hash[i] > target[i]) return false;
     }
@@ -163,8 +155,11 @@ kernel void mineKernel(
     device const uint32_t* nonceBasePtr   [[buffer(2)]],
     device atomic_uint* resultNonce       [[buffer(3)]],
     device uint8_t* resultHashes          [[buffer(4)]],
+    device atomic_uint* debugCounter      [[buffer(5)]],
     uint tid                              [[thread_position_in_grid]]
 ) {
+    atomic_fetch_add_explicit(debugCounter, 1, memory_order_relaxed);
+
     uint nonce0 = *nonceBasePtr + tid * 2;
     uint nonce1 = nonce0 + 1;
 

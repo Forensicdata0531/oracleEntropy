@@ -2,5 +2,5 @@
 #include <nlohmann/json.hpp>
 #include "block.hpp"
 
-// Updated signature: accept JSON object directly
 BlockHeader parseBlockHeader(const nlohmann::json& j);
+std::array<uint8_t, 80> serializeBlockHeader(const BlockHeader& header);

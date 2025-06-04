@@ -1,52 +1,47 @@
 #include "block_utils.hpp"
 #include <stdexcept>
 #include <sstream>
+#include <cstring>
 
 using json = nlohmann::json;
 
-// Helper to parse hex string and reverse bytes for little endian
 static std::array<uint8_t, 32> parseReversedHash(const std::string& hexStr) {
-    if (hexStr.size() != 64) {
-        std::ostringstream oss;
-        oss << "Invalid hex string length for hash: expected 64 but got " << hexStr.size();
-        throw std::runtime_error(oss.str());
-    }
+    if (hexStr.size() != 64)
+        throw std::runtime_error("Invalid hex length for hash");
 
     std::array<uint8_t, 32> result;
     for (int i = 0; i < 32; ++i) {
         std::string byteStr = hexStr.substr((31 - i) * 2, 2);
-        try {
-            result[i] = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
-        } catch (const std::exception& e) {
-            throw std::runtime_error("Invalid hex character in hash string");
-        }
+        result[i] = static_cast<uint8_t>(std::stoul(byteStr, nullptr, 16));
     }
     return result;
 }
 
 BlockHeader parseBlockHeader(const json& j) {
     BlockHeader header;
-
-    if (!j.contains("version") || j["version"].is_null())
-        throw std::runtime_error("JSON missing or null 'version' field");
     header.version = j.at("version").get<uint32_t>();
-
-    if (!j.contains("previousblockhash") || j["previousblockhash"].is_null())
-        throw std::runtime_error("JSON missing or null 'previousblockhash' field");
-    header.prevBlockHash = parseReversedHash(j.at("previousblockhash").get<std::string>());
-
-    if (!j.contains("merkleroot") || j["merkleroot"].is_null())
-        throw std::runtime_error("JSON missing or null 'merkleroot' field");
-    header.merkleRoot = parseReversedHash(j.at("merkleroot").get<std::string>());
-
-    if (!j.contains("curtime") || j["curtime"].is_null())
-        throw std::runtime_error("JSON missing or null 'curtime' field");
+    header.prevBlockHash = parseReversedHash(j.at("previousblockhash"));
+    header.merkleRoot = parseReversedHash(j.at("merkleroot"));
     header.timestamp = j.at("curtime").get<uint32_t>();
-
-    if (!j.contains("bits") || j["bits"].is_null())
-        throw std::runtime_error("JSON missing or null 'bits' field");
     header.bits = std::stoul(j.at("bits").get<std::string>(), nullptr, 16);
-
     header.nonce = 0;
     return header;
+}
+
+static void writeLE(uint8_t* dst, uint32_t value) {
+    dst[0] = value & 0xFF;
+    dst[1] = (value >> 8) & 0xFF;
+    dst[2] = (value >> 16) & 0xFF;
+    dst[3] = (value >> 24) & 0xFF;
+}
+
+std::array<uint8_t, 80> serializeBlockHeader(const BlockHeader& h) {
+    std::array<uint8_t, 80> out{};
+    writeLE(out.data(), h.version);
+    std::memcpy(out.data() + 4, h.prevBlockHash.data(), 32);
+    std::memcpy(out.data() + 36, h.merkleRoot.data(), 32);
+    writeLE(out.data() + 68, h.timestamp);
+    writeLE(out.data() + 72, h.bits);
+    writeLE(out.data() + 76, h.nonce);
+    return out;
 }
