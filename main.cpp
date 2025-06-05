@@ -182,6 +182,8 @@ int main() {
 
             {
                 std::lock_guard<std::mutex> lock(stats.mutex);
+
+                // ✅ Always update sample hash every batch
                 stats.sampleHashStr = bytesToHex(sampleHash);
                 std::copy_n(sampleHash.begin(), std::min(sampleHash.size(), stats.sampleHash.size()), stats.sampleHash.begin());
 
