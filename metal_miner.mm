@@ -1,177 +1,230 @@
-#include "midstate.hpp"
-#include "block_utils.hpp"
-#include "rpc.hpp"
-#include "block.hpp"
-
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
-#include <iostream>
-#import <simd/simd.h>
+#import <simd/simd.h>  // Needed for simd::uint2
+#import <iostream>
+#import <vector>
+#import <fstream>
+#import <sstream>
+#import "block.hpp"
+#import "midstate.hpp"
+#include <nlohmann/json.hpp>
 
-bool metalMineBlock(const BlockHeader& header,
-                    const std::vector<uint8_t>& target,
-                    uint32_t initialNonceBase,
-                    uint32_t& validIndex,
-                    std::vector<uint8_t>& validHash,
-                    std::vector<uint8_t>& sampleHashOut,
-                    uint64_t& totalHashesTried)
-{
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (!device) {
-        std::cerr << "❌ Failed to create Metal device.\n";
-        return false;
-    }
+// External logging function from main.cpp
+extern void logLine(const std::string&);
 
-    NSError* error = nil;
-    id<MTLLibrary> library = [device newLibraryWithFile:@"build/mineKernel.metallib" error:&error];
-    if (!library) {
-        std::cerr << "❌ Failed to load Metal library: " << error.localizedDescription.UTF8String << "\n";
-        return false;
-    }
+static constexpr size_t THREADS_PER_GRID = 131072;
+static constexpr size_t HASHES_PER_THREAD = 2;
 
-    id<MTLFunction> function = [library newFunctionWithName:@"mineMidstateSIMD2"];
-    if (!function) {
-        std::cerr << "❌ Failed to find Metal function 'mineMidstateSIMD2'.\n";
-        return false;
-    }
+class MetalMiner {
+private:
+    id<MTLDevice> device;
+    id<MTLCommandQueue> commandQueue;
+    id<MTLComputePipelineState> pipelineState;
 
-    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
-    if (!pipeline) {
-        std::cerr << "❌ Failed to create pipeline: " << error.localizedDescription.UTF8String << "\n";
-        return false;
-    }
+    id<MTLBuffer> headerPrefixBuffer;  // 64 bytes per thread (version+prevBlockHash+merkleRoot)
+    id<MTLBuffer> tailWordBuffer;      // uint2 * THREADS_PER_GRID (8 bytes per thread)
+    id<MTLBuffer> targetBuffer;        // 32 bytes target
+    id<MTLBuffer> resultNonceBuffer;   // atomic uint32_t
+    id<MTLBuffer> resultHashBuffer;    // 64 bytes per thread (2 hashes * 32 bytes)
 
-    id<MTLCommandQueue> queue = [device newCommandQueue];
-    if (!queue) {
-        std::cerr << "❌ Failed to create command queue.\n";
-        return false;
-    }
-
-    const size_t totalThreads = 131072; // 128k threads
-    const size_t threadgroupSize = 256;
-    size_t numThreadgroups = (totalThreads + threadgroupSize - 1) / threadgroupSize;
-
-    // === Load midstates ===
-    std::vector<MidstateEntry> entries = loadMidstates("oracle/top_midstates.json");
-    if (entries.size() < totalThreads) {
-        std::cerr << "❌ Need at least " << totalThreads << " midstate entries. Got " << entries.size() << "\n";
-        return false;
-    }
-
-    // Prepare midstate and tail buffers
-    std::vector<vector_uint2> midstateBuf(totalThreads * 8);
-    std::vector<vector_uint2> tailBuf(totalThreads);
-
-    for (size_t i = 0; i < totalThreads; ++i) {
-        for (int j = 0; j < 8; ++j) {
-            midstateBuf[i * 8 + j] = vector_uint2{entries[i].midstate[j], 0};
+public:
+    MetalMiner(id<MTLDevice> device, id<MTLLibrary> library) : device(device) {
+        NSError *error = nil;
+        id<MTLFunction> function = [library newFunctionWithName:@"mineMidstateSIMD2"];
+        pipelineState = [device newComputePipelineStateWithFunction:function error:&error];
+        if (error) {
+            logLine("Failed to create pipeline state: " + std::string(error.localizedDescription.UTF8String));
+            exit(1);
         }
-        tailBuf[i] = vector_uint2{entries[i].tail, 0};
+        commandQueue = [device newCommandQueue];
+
+        headerPrefixBuffer = [device newBufferWithLength:THREADS_PER_GRID * 64 options:MTLResourceStorageModeShared];
+        tailWordBuffer = [device newBufferWithLength:THREADS_PER_GRID * sizeof(simd::uint2) options:MTLResourceStorageModeShared];
+        targetBuffer = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+        resultNonceBuffer = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        resultHashBuffer = [device newBufferWithLength:THREADS_PER_GRID * HASHES_PER_THREAD * 32 options:MTLResourceStorageModeShared];
+
+        reset();
     }
 
-    // Target vector: convert 32-byte target to uint32_t little endian pairs
-    std::vector<vector_uint2> targetVec(8);
-    for (int i = 0; i < 8; ++i) {
-        uint32_t val = ((uint32_t*)&target[0])[i];
-        targetVec[i] = vector_uint2{val, 0};
+    void reset() {
+        uint32_t zero = 0;
+        memcpy(resultNonceBuffer.contents, &zero, sizeof(uint32_t));
     }
 
-    // Output buffer for results: 18 uint2 per thread
-    std::vector<vector_uint2> output(totalThreads * 18, vector_uint2{0, 0});
-
-    id<MTLBuffer> midBuf = [device newBufferWithBytes:midstateBuf.data()
-                                               length:midstateBuf.size() * sizeof(vector_uint2)
-                                              options:MTLResourceStorageModeShared];
-    id<MTLBuffer> tailWordBuf = [device newBufferWithBytes:tailBuf.data()
-                                                    length:tailBuf.size() * sizeof(vector_uint2)
-                                                   options:MTLResourceStorageModeShared];
-    id<MTLBuffer> tgtBuf = [device newBufferWithBytes:targetVec.data()
-                                              length:targetVec.size() * sizeof(vector_uint2)
-                                             options:MTLResourceStorageModeShared];
-    id<MTLBuffer> outBuf = [device newBufferWithBytes:output.data()
-                                              length:output.size() * sizeof(vector_uint2)
-                                             options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nonceBuf = [device newBufferWithLength:sizeof(uint32_t)
-                                                 options:MTLResourceStorageModeShared];
-
-    if (!midBuf || !tailWordBuf || !tgtBuf || !outBuf || !nonceBuf) {
-        std::cerr << "❌ One or more Metal buffers failed to allocate.\n";
-        return false;
+    void setHeaderPrefixes(const std::vector<uint8_t>& headerPrefixes) {
+        // headerPrefixes.size() must be THREADS_PER_GRID * 64
+        memcpy(headerPrefixBuffer.contents, headerPrefixes.data(), headerPrefixes.size());
     }
 
-    *((uint32_t*)nonceBuf.contents) = initialNonceBase;
+    void setTailWords(const std::vector<simd::uint2>& tailWords) {
+        memcpy(tailWordBuffer.contents, tailWords.data(), tailWords.size() * sizeof(simd::uint2));
+    }
 
-    id<MTLCommandBuffer> cmd = [queue commandBuffer];
-    [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-        if (cb.error) {
-            std::cerr << "⚠️ Metal error: " << cb.error.localizedDescription.UTF8String << std::endl;
+    void setTarget(const std::vector<uint8_t>& target) {
+        memcpy(targetBuffer.contents, target.data(), target.size());
+    }
+
+    bool mine(uint32_t& foundNonce, std::vector<uint8_t>& foundHash, uint64_t& hashesTried, std::vector<uint8_t>& sampleHashOut) {
+        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:pipelineState];
+        [encoder setBuffer:headerPrefixBuffer offset:0 atIndex:0];
+        [encoder setBuffer:tailWordBuffer offset:0 atIndex:1];
+        [encoder setBuffer:targetBuffer offset:0 atIndex:2];
+        [encoder setBuffer:nil offset:0 atIndex:3]; // output buffer unused here
+        [encoder setBuffer:resultNonceBuffer offset:0 atIndex:4];
+        [encoder setBuffer:resultHashBuffer offset:0 atIndex:5];
+
+        NSUInteger maxThreads = pipelineState.maxTotalThreadsPerThreadgroup;
+        NSUInteger threadgroupSize = maxThreads > THREADS_PER_GRID ? THREADS_PER_GRID : maxThreads;
+        NSUInteger numThreadgroups = (THREADS_PER_GRID + threadgroupSize - 1) / threadgroupSize;
+
+        MTLSize gridSize = MTLSizeMake(numThreadgroups * threadgroupSize, 1, 1);
+        MTLSize threadgroupSizeMTL = MTLSizeMake(threadgroupSize, 1, 1);
+
+        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSizeMTL];
+        [encoder endEncoding];
+
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        if (commandBuffer.error) {
+            logLine("GPU error: " + std::string(commandBuffer.error.localizedDescription.UTF8String));
+            return false;
         }
-    }];
 
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc setComputePipelineState:pipeline];
-    [enc setBuffer:midBuf offset:0 atIndex:0];
-    [enc setBuffer:tailWordBuf offset:0 atIndex:1];
-    [enc setBuffer:tgtBuf offset:0 atIndex:2];
-    [enc setBuffer:outBuf offset:0 atIndex:3];
-    [enc setBuffer:nonceBuf offset:0 atIndex:4];
+        hashesTried = THREADS_PER_GRID * HASHES_PER_THREAD;
 
-    [enc dispatchThreadgroups:MTLSizeMake((uint32_t)numThreadgroups, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake((uint32_t)threadgroupSize, 1, 1)];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
+        uint32_t nonceValue = *(uint32_t*)resultNonceBuffer.contents;
 
-    totalHashesTried = totalThreads * 2; // 2 nonces per thread
+        // Always update sample hash from first hash in result buffer even if no valid nonce
+        uint8_t* samplePtr = (uint8_t*)resultHashBuffer.contents;
+        sampleHashOut.assign(samplePtr, samplePtr + 32);
 
-    auto* result = (vector_uint2*)outBuf.contents;
-    if (!result) {
-        std::cerr << "❌ Could not read Metal output buffer.\n";
-        return false;
-    }
-
-    bool foundValid = false;
-    uint32_t foundIndex = 0;
-    std::vector<uint8_t> foundHash(32);
-
-    // Find valid nonce in results
-    for (size_t thread = 0; thread < totalThreads; ++thread) {
-        for (int lane = 0; lane < 2; ++lane) {
-            size_t base = thread * 18 + lane * 9;
-            if (result[base].y == 1) {
-                foundValid = true;
-                foundIndex = (uint32_t)thread;
-                uint32_t nonce = result[base].x;
-                foundHash.resize(32);
-                for (int i = 0; i < 8; ++i) {
-                    uint32_t h = result[base + 1 + i].x;
-                    foundHash[i * 4 + 0] = (h >> 24) & 0xff;
-                    foundHash[i * 4 + 1] = (h >> 16) & 0xff;
-                    foundHash[i * 4 + 2] = (h >> 8) & 0xff;
-                    foundHash[i * 4 + 3] = h & 0xff;
-                }
-                break;
-            }
+        if (nonceValue == 0) {
+            foundNonce = 0;
+            return false;
         }
-        if (foundValid) break;
-    }
 
-    // Extract sample hash from first thread/lane (for UI)
-    size_t sampleBase = 0; // thread=0, lane=0
-    sampleHashOut.resize(32);
-    for (int i = 0; i < 8; ++i) {
-        uint32_t h = result[sampleBase + 1 + i].x;
-        sampleHashOut[i * 4 + 0] = (h >> 24) & 0xff;
-        sampleHashOut[i * 4 + 1] = (h >> 16) & 0xff;
-        sampleHashOut[i * 4 + 2] = (h >> 8) & 0xff;
-        sampleHashOut[i * 4 + 3] = h & 0xff;
-    }
+        foundNonce = nonceValue;
 
-    if (foundValid) {
-        validIndex = foundIndex;
-        validHash = foundHash;
+        // Calculate index and offset in the hash buffer for found nonce
+        uint32_t index = nonceValue / HASHES_PER_THREAD;
+        uint32_t offsetInThread = nonceValue % HASHES_PER_THREAD;
+
+        if (index >= THREADS_PER_GRID) {
+            logLine("Warning: Found nonce index out of bounds.");
+            return false;
+        }
+
+        uint8_t* hashBase = (uint8_t*)resultHashBuffer.contents + index * HASHES_PER_THREAD * 32 + offsetInThread * 32;
+        foundHash.assign(hashBase, hashBase + 32);
+
         return true;
     }
+};
 
-    return false;
+// --- Helper function to load midstates and tails from JSON ---
+// Now loads header prefixes (first 64 bytes) and tails
+bool loadOracleHeaderPrefixesAndTails(const std::string& filepath,
+                                      std::vector<uint8_t>& headerPrefixes,
+                                      std::vector<simd::uint2>& tails)
+{
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        logLine("Failed to open oracle midstates file: " + filepath);
+        return false;
+    }
+
+    nlohmann::json j;
+    try {
+        file >> j;
+    } catch (const std::exception& e) {
+        logLine(std::string("Failed to parse JSON: ") + e.what());
+        return false;
+    }
+
+    if (!j.is_array()) {
+        logLine("Oracle midstates JSON root is not an array.");
+        return false;
+    }
+
+    size_t count = std::min(j.size(), THREADS_PER_GRID);
+    headerPrefixes.resize(count * 64);
+    tails.resize(count);
+
+    for (size_t i = 0; i < count; ++i) {
+        const auto& entry = j[i];
+        if (!entry.contains("headerPrefix") || !entry.contains("tail")) {
+            logLine("Invalid midstate entry missing keys at index: " + std::to_string(i));
+            return false;
+        }
+
+        const auto& prefixArray = entry["headerPrefix"];
+        if (!prefixArray.is_array() || prefixArray.size() != 64) {
+            logLine("Header prefix size invalid at index: " + std::to_string(i));
+            return false;
+        }
+        for (size_t b = 0; b < 64; ++b) {
+            headerPrefixes[i * 64 + b] = prefixArray[b].get<uint8_t>();
+        }
+
+        uint32_t tailVal = entry["tail"].get<uint32_t>();
+        tails[i] = simd::uint2(tailVal);
+    }
+
+    return true;
+}
+
+static MetalMiner* gMiner = nullptr;
+
+bool metalMineBlock(
+    const BlockHeader& header,
+    const std::vector<uint8_t>& target,
+    uint32_t initialNonceBase,
+    uint32_t& validIndex,
+    std::vector<uint8_t>& validHash,
+    std::vector<uint8_t>& sampleHashOut,
+    uint64_t& totalHashesTried)
+{
+    if (!gMiner) {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            logLine("Failed to create Metal device.");
+            return false;
+        }
+        NSError* error = nil;
+        NSString* path = @"/Users/jacewheeler/desktop/restoredmetalminer/oracleentropymining/oracleentropymining/mineKernel.metallib";
+        id<MTLLibrary> library = [device newLibraryWithFile:path error:&error];
+        if (!library) {
+            logLine("Failed to load Metal library: " + std::string(error.localizedDescription.UTF8String));
+            return false;
+        }
+
+        gMiner = new MetalMiner(device, library);
+        logLine("MetalMiner instance created.");
+    }
+
+    static bool loadedHeaderPrefixes = false;
+    static std::vector<uint8_t> headerPrefixes;
+    static std::vector<simd::uint2> tailWords;
+
+    if (!loadedHeaderPrefixes) {
+        if (!loadOracleHeaderPrefixesAndTails("oracle/top_midstates.json", headerPrefixes, tailWords)) {
+            logLine("Failed to load oracle header prefixes.");
+            return false;
+        }
+        gMiner->setHeaderPrefixes(headerPrefixes);
+        gMiner->setTailWords(tailWords);
+        loadedHeaderPrefixes = true;
+    }
+
+    gMiner->setTarget(target);
+    gMiner->reset();
+
+    bool found = gMiner->mine(validIndex, validHash, totalHashesTried, sampleHashOut);
+
+    return found;
 }

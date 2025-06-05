@@ -34,12 +34,6 @@ inline void sha256_compress(thread simd::uint2* w, thread simd::uint2* digest) {
     simd::uint2 g = digest[6];
     simd::uint2 h = digest[7];
 
-    for (uint i = 16; i < 64; i++) {
-        simd::uint2 s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-        simd::uint2 s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-    }
-
     for (uint i = 0; i < 64; i++) {
         simd::uint2 S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
         simd::uint2 ch = (e & f) ^ ((~e) & g);
@@ -80,12 +74,13 @@ inline void sha256_double(thread simd::uint2* block, thread simd::uint2* digest)
     thread simd::uint2 block2[16];
     for (uint i = 0; i < 8; i++) {
         uint32_t val = digest[i][0];
+        // Convert endianess for second round input
         block2[i] = simd::uint2(
             ((val & 0xff000000) >> 24) |
             ((val & 0x00ff0000) >> 8) |
             ((val & 0x0000ff00) << 8) |
             ((val & 0x000000ff) << 24),
-            0); // Second lane is zero, process serially
+            0);
     }
     block2[8] = simd::uint2(0x80000000, 0);
     for (uint i = 9; i < 15; i++) block2[i] = simd::uint2(0, 0);
@@ -123,10 +118,10 @@ inline bool check_target(const thread uint8_t* hash, device const uint8_t* targe
 }
 
 kernel void mineMidstateSIMD2(
-    device const uint2* midstates [[ buffer(0) ]],  // bitsliced midstates, unused here
-    device const uint2* tailWords [[ buffer(1) ]],  // tail + nonce area
+    device const uint8_t* headerPrefixes [[ buffer(0) ]], // 64 bytes * THREADS_PER_GRID
+    device const uint2* tailWords [[ buffer(1) ]],
     device const uint8_t* target [[ buffer(2) ]],
-    device uint2* output [[ buffer(3) ]],           // output storage, unused here
+    device uint2* output [[ buffer(3) ]], // unused, must remain
     device atomic_uint* resultNonce [[ buffer(4) ]],
     device uint8_t* resultHashes [[ buffer(5) ]],
     uint tid [[ thread_position_in_grid ]]
@@ -139,13 +134,16 @@ kernel void mineMidstateSIMD2(
     uint currentResultNonce = atomic_load_explicit(resultNonce, memory_order_relaxed);
     if (currentResultNonce != 0) return;
 
-    // Reconstruct 80-byte block with nonce for both lanes
+    // Reconstruct 80-byte block header for this thread & lane:
     thread uint8_t header_bytes[80];
 
-    // Since we cannot reconstruct the original midstate bytes, zero out first 64 bytes here
-    for (uint i = 0; i < 64; i++) header_bytes[i] = 0;
+    // Copy the 64-byte prefix from buffer(0)
+    const device uint8_t* prefixBase = &headerPrefixes[threadIdx * 64];
+    for (uint i = 0; i < 64; i++) {
+        header_bytes[i] = prefixBase[i];
+    }
 
-    // Unpack tailWords (bitsliced uint2) into last 8 bytes (64..71)
+    // Append tailWords (bytes 64..71)
     uint tail_word0 = tailWords[threadIdx].x;
     uint tail_word1 = tailWords[threadIdx].y;
 
@@ -159,11 +157,10 @@ kernel void mineMidstateSIMD2(
     header_bytes[70] = (tail_word1 >> 16) & 0xff;
     header_bytes[71] = (tail_word1 >> 24) & 0xff;
 
-    // Load the current nonce base atomically
-    uint baseNonce = atomic_load_explicit(resultNonce, memory_order_relaxed);
-    if (baseNonce == 0) baseNonce = 0; // If none found, start at zero
+    // Compute nonce from thread and lane
+    uint baseNonce = tid * 2;
+    uint nonce = baseNonce + lane;
 
-    uint nonce = baseNonce + threadIdx * 2 + lane;
     header_bytes[76] = (nonce >> 0) & 0xff;
     header_bytes[77] = (nonce >> 8) & 0xff;
     header_bytes[78] = (nonce >> 16) & 0xff;
@@ -176,11 +173,11 @@ kernel void mineMidstateSIMD2(
                       (uint32_t(header_bytes[i*4 + 1]) << 16) |
                       (uint32_t(header_bytes[i*4 + 2]) << 8)  |
                       (uint32_t(header_bytes[i*4 + 3]));
-        uint32_t w1 = w0; // Duplicate for bitslicing lane 1
+        uint32_t w1 = w0; // For bitslicing: same value for both lanes
         block[i] = simd::uint2(w0, w1);
     }
 
-    // Initialize digest IV
+    // Init IV
     thread simd::uint2 digest[8];
     digest[0] = simd::uint2(0x6a09e667);
     digest[1] = simd::uint2(0xbb67ae85);
@@ -191,20 +188,18 @@ kernel void mineMidstateSIMD2(
     digest[6] = simd::uint2(0x1f83d9ab);
     digest[7] = simd::uint2(0x5be0cd19);
 
-    // Perform double SHA256 compression
+    // Double SHA-256
     sha256_double(block, digest);
 
-    // Output hashes for both lanes
+    // Output hashes for lanes
     thread uint8_t hash0[32];
     thread uint8_t hash1[32];
     output_hash(digest, hash0, 0);
     output_hash(digest, hash1, 1);
 
-    // Check target against hashes
     bool valid0 = check_target(hash0, target);
     bool valid1 = check_target(hash1, target);
 
-    // Atomically store nonce and hash if valid (lane 0)
     if (valid0) {
         uint expected = 0;
         if (atomic_compare_exchange_weak_explicit(resultNonce, &expected, nonce, memory_order_relaxed, memory_order_relaxed)) {
@@ -213,8 +208,6 @@ kernel void mineMidstateSIMD2(
             }
         }
     }
-
-    // Atomically store nonce and hash if valid (lane 1)
     if (valid1) {
         uint expected = 0;
         uint nonce1 = nonce + 1;
