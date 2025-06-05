@@ -36,16 +36,16 @@ std::vector<MidstateEntry> loadMidstates(const std::string& filename) {
             continue;
         }
 
-        // Pack bytes into 8 uint32_t elements (big-endian)
+        // Pack bytes into 8 uint32_t elements in LITTLE-ENDIAN
         for (int i = 0; i < 8; ++i) {
             e.midstate[i] = 
-                (uint32_t(midBytes[i * 4 + 0]) << 24) |
-                (uint32_t(midBytes[i * 4 + 1]) << 16) |
-                (uint32_t(midBytes[i * 4 + 2]) << 8)  |
-                (uint32_t(midBytes[i * 4 + 3]));
+                (uint32_t(midBytes[i * 4 + 3]) << 24) |
+                (uint32_t(midBytes[i * 4 + 2]) << 16) |
+                (uint32_t(midBytes[i * 4 + 1]) << 8)  |
+                (uint32_t(midBytes[i * 4 + 0]));
         }
 
-        // Convert tail hex string to uint32_t (4 bytes)
+        // Convert tail hex string to uint32_t (4 bytes) in LITTLE-ENDIAN
         std::string tailHex = item["tail"].get<std::string>();
         std::vector<uint8_t> tailBytes = hexToBytes(tailHex);
         if (tailBytes.size() < 4) {
@@ -54,10 +54,10 @@ std::vector<MidstateEntry> loadMidstates(const std::string& filename) {
         }
 
         e.tail = 
-            (uint32_t(tailBytes[0]) << 24) |
-            (uint32_t(tailBytes[1]) << 16) |
-            (uint32_t(tailBytes[2]) << 8)  |
-            (uint32_t(tailBytes[3]));
+            (uint32_t(tailBytes[3]) << 24) |
+            (uint32_t(tailBytes[2]) << 16) |
+            (uint32_t(tailBytes[1]) << 8)  |
+            (uint32_t(tailBytes[0]));
 
         entries.push_back(e);
     }

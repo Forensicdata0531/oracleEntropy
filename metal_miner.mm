@@ -30,7 +30,7 @@ private:
 public:
     MetalMiner(id<MTLDevice> device, id<MTLLibrary> library) : device(device) {
         NSError *error = nil;
-        id<MTLFunction> function = [library newFunctionWithName:@"mineMidstateSIMD2"];
+        id<MTLFunction> function = [library newFunctionWithName:@"mineKernel"];
         pipelineState = [device newComputePipelineStateWithFunction:function error:&error];
         if (error) {
             logLine("Failed to create pipeline state: " + std::string(error.localizedDescription.UTF8String));
