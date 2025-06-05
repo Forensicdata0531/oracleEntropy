@@ -186,22 +186,17 @@ int main() {
                 std::copy_n(sampleHash.begin(), std::min(sampleHash.size(), stats.sampleHash.size()), stats.sampleHash.begin());
 
                 if (!validHash.empty()) {
-                    if (validHash < bestSampleHash) {
-                        bestSampleHash = validHash;
-                    }
-                    if (found)
-                        stats.validHashStr = bytesToHex(validHash);
+                    stats.validNonce = validIndex;
+                    stats.validHashStr = bytesToHex(validHash);
+                    stats.found.store(true);
+
+                    logLine("✅ Valid hash found at midstate index: " + std::to_string(validIndex));
+                    std::string fullBlockHex = createFullBlockHex(header, validIndex, "", nlohmann::json::array());
+                    submitBlockRpc(rpc, fullBlockHex);
+                    break;
+                } else {
+                    stats.found.store(false);
                 }
-            }
-
-            stats.validNonce = found ? validIndex : 0;
-            stats.found.store(found);
-
-            if (found) {
-                logLine("✅ Block mined using midstate index: " + std::to_string(validIndex));
-                std::string fullBlockHex = createFullBlockHex(header, validIndex, "", nlohmann::json::array());
-                submitBlockRpc(rpc, fullBlockHex);
-                break;
             }
         }
 
