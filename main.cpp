@@ -1,4 +1,3 @@
-// main.cpp
 #include "utils.hpp"
 #include "block.hpp"
 #include "block_utils.hpp"
@@ -49,7 +48,13 @@ bool submitBlockRpc(RpcClient& rpc, const std::string& blockHex) {
         params.push_back(blockHex);
         nlohmann::json response = rpc.call("submitblock", params);
         if (response.contains("error") && !response["error"].is_null()) {
-            logLine("[RPC Submitblock Error]: " + response["error"].value("message", "Unknown error"));
+            if (response["error"].is_object()) {
+                logLine("[RPC Submitblock Error]: " + response["error"].value("message", "Unknown error"));
+            } else if (response["error"].is_string()) {
+                logLine("[RPC Submitblock Error]: " + response["error"].get<std::string>());
+            } else {
+                logLine("[RPC Submitblock Error]: Unknown error format");
+            }
             return false;
         } else {
             logLine("[RPC Submitblock]: Block accepted.");
@@ -96,6 +101,7 @@ void uiLoop() {
         }
 
         wrefresh(statsWin);
+
         auto lines = ringLog.getLines(logHeight - 1);
         for (size_t i = 0; i < lines.size(); ++i)
             mvwprintw(logWin, i, 0, "%s", lines[i].c_str());
@@ -117,28 +123,26 @@ int main() {
         return 1;
     }
 
+    std::thread uiThread;
+
     try {
         RpcClient rpc("http://127.0.0.1:8332", "Jw2Fresh420", "0dvsiwbrbi0BITC0IN2021");
 
         logLine("📡 Fetching block template from RPC...");
-        auto rpcResponse = rpc.call("getblocktemplate", {{{"rules", {"segwit"}}}});
-        if (!rpcResponse.contains("result") || rpcResponse["result"].is_null())
-            throw std::runtime_error("Invalid block template from RPC");
+        BlockTemplate tpl = getBlockTemplate(rpc);
 
-        auto blockTemplateJson = rpcResponse["result"];
-        int blockHeight = blockTemplateJson.value("height", 0);
-        std::string payoutAddress = "bc1qgj6au67l9n5rjnwsm48s64ermf94jfm2r4mmk7";
-        std::string coinbaseTxHex = createCoinbaseTx(blockHeight, payoutAddress);
+        BlockHeader header;
+        header.version = tpl.version;
 
-        std::vector<std::vector<uint8_t>> txHashes = { txHashFromHex(coinbaseTxHex) };
-        for (const auto& tx : blockTemplateJson["transactions"])
-            txHashes.push_back(txHashFromHex(tx["data"]));
+        if (tpl.prevBlockHash.size() != 32) throw std::runtime_error("Invalid prevBlockHash size");
+        std::copy_n(tpl.prevBlockHash.begin(), 32, header.prevBlockHash.begin());
 
-        std::vector<uint8_t> merkleRoot = computeMerkleRoot(txHashes);
-        blockTemplateJson["merkleroot"] = bytesToHex({merkleRoot.rbegin(), merkleRoot.rend()});
+        if (tpl.merkleRoot.size() != 32) throw std::runtime_error("Invalid merkleRoot size");
+        std::copy_n(tpl.merkleRoot.begin(), 32, header.merkleRoot.begin());
 
-        BlockHeader header = parseBlockHeader(blockTemplateJson);
-        std::copy_n(merkleRoot.begin(), 32, header.merkleRoot.begin());
+        header.timestamp = tpl.curtime;
+        header.bits = std::stoul(tpl.bits, nullptr, 16);
+
         auto target = bitsToTarget(header.bits);
 
         logLine("🧠 Running entropy oracle...");
@@ -147,6 +151,7 @@ int main() {
             logLine("❌ Oracle dispatcher failed.");
             return 1;
         }
+
         logLine("✅ Oracle finished scoring midstates.");
         logLine("🎯 Target (difficulty bits): " + toHex(header.bits));
         logLine("⚙️ Starting GPU mining...");
@@ -156,7 +161,7 @@ int main() {
         stats.startTime.store(std::chrono::steady_clock::now());
         stats.quit.store(false);
 
-        std::thread uiThread(uiLoop);
+        uiThread = std::thread(uiLoop);
         std::vector<uint8_t> bestSampleHash(32, 0xff);
 
         while (keepRunning) {
@@ -194,16 +199,19 @@ int main() {
 
             if (found) {
                 logLine("✅ Block mined using midstate index: " + std::to_string(validIndex));
-                std::string fullBlockHex = createFullBlockHex(header, validIndex, coinbaseTxHex, blockTemplateJson["transactions"]);
+                std::string fullBlockHex = createFullBlockHex(header, validIndex, "", nlohmann::json::array());
                 submitBlockRpc(rpc, fullBlockHex);
                 break;
             }
         }
 
         stats.quit.store(true);
-        uiThread.join();
+        if (uiThread.joinable()) uiThread.join();
         logLine("🛑 Mining stopped.");
+
     } catch (const std::exception& ex) {
+        stats.quit.store(true);
+        if (uiThread.joinable()) uiThread.join();
         std::cerr << "💥 Exception: " << ex.what() << "\n";
         return 1;
     }

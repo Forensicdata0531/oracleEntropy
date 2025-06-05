@@ -1,13 +1,22 @@
 #include "utils.hpp"
 #include <sstream>
 #include <iomanip>
+#include <openssl/sha.h>
 #include <stdexcept>
-#include <CommonCrypto/CommonDigest.h>  // Use Apple CommonCrypto for SHA256
+#include <cctype>
 
 std::vector<uint8_t> hexToBytes(const std::string& hex) {
     std::vector<uint8_t> bytes;
-    if (hex.length() % 2 != 0) throw std::invalid_argument("Odd length hex string");
+    if (hex.length() % 2 != 0) {
+        throw std::invalid_argument("hex string must have even length");
+    }
+    bytes.reserve(hex.length() / 2);
     for (size_t i = 0; i < hex.length(); i += 2) {
+        char high = hex[i];
+        char low = hex[i + 1];
+        if (!std::isxdigit(high) || !std::isxdigit(low)) {
+            throw std::invalid_argument("hex string contains non-hex characters");
+        }
         uint8_t byte = static_cast<uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16));
         bytes.push_back(byte);
     }
@@ -28,13 +37,17 @@ std::string toHex(uint32_t value) {
 }
 
 std::vector<uint8_t> doubleSHA256(const std::vector<uint8_t>& input) {
-    std::vector<uint8_t> hash1(CC_SHA256_DIGEST_LENGTH);
-    std::vector<uint8_t> hash2(CC_SHA256_DIGEST_LENGTH);
+    uint8_t hash1[SHA256_DIGEST_LENGTH];
+    uint8_t hash2[SHA256_DIGEST_LENGTH];
 
-    CC_SHA256(input.data(), static_cast<CC_LONG>(input.size()), hash1.data());
-    CC_SHA256(hash1.data(), static_cast<CC_LONG>(hash1.size()), hash2.data());
+    SHA256(input.data(), input.size(), hash1);
+    SHA256(hash1, SHA256_DIGEST_LENGTH, hash2);
 
-    return hash2;
+    return std::vector<uint8_t>(hash2, hash2 + SHA256_DIGEST_LENGTH);
+}
+
+std::vector<uint8_t> sha256Double(const std::vector<uint8_t>& input) {
+    return doubleSHA256(input);
 }
 
 std::vector<uint8_t> txHashFromHex(const std::string& txHex) {
@@ -42,7 +55,7 @@ std::vector<uint8_t> txHashFromHex(const std::string& txHex) {
 }
 
 std::vector<uint8_t> computeMerkleRoot(std::vector<std::vector<uint8_t>> txHashes) {
-    if (txHashes.empty()) throw std::runtime_error("No transactions for Merkle root");
+    if (txHashes.empty()) return {};
 
     while (txHashes.size() > 1) {
         if (txHashes.size() % 2 != 0)
@@ -50,9 +63,9 @@ std::vector<uint8_t> computeMerkleRoot(std::vector<std::vector<uint8_t>> txHashe
 
         std::vector<std::vector<uint8_t>> newLevel;
         for (size_t i = 0; i < txHashes.size(); i += 2) {
-            std::vector<uint8_t> combined(txHashes[i]);
-            combined.insert(combined.end(), txHashes[i + 1].begin(), txHashes[i + 1].end());
-            newLevel.push_back(doubleSHA256(combined));
+            std::vector<uint8_t> concat(txHashes[i]);
+            concat.insert(concat.end(), txHashes[i + 1].begin(), txHashes[i + 1].end());
+            newLevel.push_back(doubleSHA256(concat));
         }
         txHashes = std::move(newLevel);
     }
@@ -60,18 +73,10 @@ std::vector<uint8_t> computeMerkleRoot(std::vector<std::vector<uint8_t>> txHashe
     return txHashes[0];
 }
 
-// Format uptime as HH:MM:SS (defined only here)
 std::string formatUptime(std::chrono::steady_clock::time_point start) {
-    auto now = std::chrono::steady_clock::now();
-    auto secs = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
-
-    int hours = static_cast<int>(secs / 3600);
-    int minutes = static_cast<int>((secs % 3600) / 60);
-    int seconds = static_cast<int>(secs % 60);
-
+    auto duration = std::chrono::steady_clock::now() - start;
+    auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
     std::ostringstream oss;
-    oss << std::setfill('0') << std::setw(2) << hours << ":"
-        << std::setw(2) << minutes << ":"
-        << std::setw(2) << seconds;
+    oss << seconds << "s";
     return oss.str();
 }

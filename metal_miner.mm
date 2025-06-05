@@ -1,173 +1,168 @@
+#include "midstate.hpp"
+#include "block_utils.hpp"
+#include "rpc.hpp"
+#include "block.hpp"
+
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
-#import <atomic>
-#import <iostream>
-#import <vector>
-#import <sstream>
-#import <fstream>
-#import "block.hpp"
-#import <nlohmann/json.hpp>
+#include <iostream>
+#import <simd/simd.h>
 
-void logLine(const std::string&);
-
-class MetalMiner {
-private:
-    id<MTLDevice> device;
-    id<MTLCommandQueue> commandQueue;
-    id<MTLComputePipelineState> pipelineState;
-
-    id<MTLBuffer> midstateBuffer;
-    id<MTLBuffer> suffix16Buffer;
-    id<MTLBuffer> targetBuffer;
-    id<MTLBuffer> resultNonceBuffer;
-    id<MTLBuffer> resultHashesBuffer;
-    id<MTLBuffer> debugCounterBuffer;
-    id<MTLBuffer> nonceBaseBuffer;
-
-    uint32_t nonceBase;
-    size_t threadCount;
-
-public:
-    MetalMiner(id<MTLDevice> dev, id<MTLLibrary> lib, size_t threads)
-        : device(dev), nonceBase(0), threadCount(threads) {
-        commandQueue = [device newCommandQueue];
-
-        NSError *error = nil;
-        id<MTLFunction> fn = [lib newFunctionWithName:@"mineMidstateContinuation"];
-        pipelineState = [device newComputePipelineStateWithFunction:fn error:&error];
-        if (!pipelineState) {
-            logLine("[Metal ERROR] Failed to create pipeline.");
-            exit(1);
-        }
-
-        targetBuffer        = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
-        resultNonceBuffer   = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        resultHashesBuffer  = [device newBufferWithLength:threadCount * 32 options:MTLResourceStorageModeShared];
-        debugCounterBuffer  = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        nonceBaseBuffer     = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    }
-
-    void loadMidstateTailJSON(const std::string& path) {
-        std::ifstream in(path);
-        if (!in) {
-            logLine("[ERROR] Failed to open JSON: " + path);
-            exit(1);
-        }
-
-        nlohmann::json j;
-        in >> j;
-
-        std::vector<uint8_t> midstates;
-        std::vector<uint8_t> suffixes;
-        for (const auto& obj : j) {
-            if (!obj.contains("midstate") || !obj.contains("tail"))
-                continue;
-
-            std::string mid = obj["midstate"];
-            std::string tail = obj["tail"];
-
-            for (size_t i = 0; i < 64; i += 2)
-                midstates.push_back((uint8_t)std::stoi(mid.substr(i, 2), nullptr, 16));
-            for (size_t i = 0; i < 24; i += 2)
-                suffixes.push_back((uint8_t)std::stoi(tail.substr(i, 2), nullptr, 16));
-        }
-
-        threadCount = midstates.size() / 32;
-        midstateBuffer = [device newBufferWithBytes:midstates.data() length:midstates.size() options:MTLResourceStorageModeShared];
-
-        suffix16Buffer = [device newBufferWithLength:threadCount * 16 options:MTLResourceStorageModeShared];
-        uint8_t* dst = (uint8_t*)suffix16Buffer.contents;
-        for (size_t i = 0; i < threadCount; ++i) {
-            memcpy(dst + i * 16, &suffixes[i * 12], 12);
-            memset(dst + i * 16 + 12, 0, 4);
-        }
-
-        logLine("[INFO] Loaded " + std::to_string(threadCount) + " midstates.");
-    }
-
-    void setTarget(const uint8_t* targetLE) {
-        memcpy(targetBuffer.contents, targetLE, 32);
-    }
-
-    void setNonceBase(uint32_t base) {
-        nonceBase = base;
-        memcpy(nonceBaseBuffer.contents, &nonceBase, sizeof(uint32_t));
-    }
-
-    bool mine(uint32_t& foundNonce, std::vector<uint8_t>& foundHash,
-              std::vector<uint8_t>& sampleHash, uint64_t& hashesTried) {
-        memset(resultNonceBuffer.contents, 0, sizeof(uint32_t));
-        memset(resultHashesBuffer.contents, 0, threadCount * 32);
-        memset(debugCounterBuffer.contents, 0, sizeof(uint32_t));
-
-        id<MTLCommandBuffer> cmd = [commandQueue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
-
-        [encoder setComputePipelineState:pipelineState];
-        [encoder setBuffer:midstateBuffer offset:0 atIndex:0];
-        [encoder setBuffer:suffix16Buffer offset:0 atIndex:1];
-        [encoder setBuffer:targetBuffer offset:0 atIndex:2];
-        [encoder setBuffer:resultNonceBuffer offset:0 atIndex:3];
-        [encoder setBuffer:resultHashesBuffer offset:0 atIndex:4];
-        [encoder setBuffer:debugCounterBuffer offset:0 atIndex:5];
-        [encoder setBuffer:nonceBaseBuffer offset:0 atIndex:6];
-
-        NSUInteger threadGroupSize = pipelineState.maxTotalThreadsPerThreadgroup;
-        MTLSize grid = MTLSizeMake(threadCount, 1, 1);
-        MTLSize tg = MTLSizeMake(std::min((size_t)threadGroupSize, threadCount), 1, 1);
-        [encoder dispatchThreads:grid threadsPerThreadgroup:tg];
-        [encoder endEncoding];
-
-        [cmd commit];
-        [cmd waitUntilCompleted];
-
-        hashesTried = threadCount;
-
-        uint32_t nonce = *(uint32_t*)resultNonceBuffer.contents;
-        sampleHash.assign((uint8_t*)resultHashesBuffer.contents, (uint8_t*)resultHashesBuffer.contents + 32);
-
-        if (nonce != 0) {
-            size_t offset = (nonce - nonceBase) * 32;
-            foundNonce = nonce;
-            uint8_t* ptr = (uint8_t*)resultHashesBuffer.contents + offset;
-            foundHash.assign(ptr, ptr + 32);
-            return true;
-        }
-
-        nonceBase += threadCount;
-        memcpy(nonceBaseBuffer.contents, &nonceBase, sizeof(uint32_t));
+bool metalMineBlock(const BlockHeader& header,
+                    const std::vector<uint8_t>& target,
+                    uint32_t initialNonceBase,
+                    uint32_t& validIndex,
+                    std::vector<uint8_t>& validHash,
+                    std::vector<uint8_t>& sampleHashOut,
+                    uint64_t& totalHashesTried)
+{
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) {
+        std::cerr << "❌ Failed to create Metal device.\n";
         return false;
     }
-};
 
-bool metalMineBlock(
-    const BlockHeader& header,
-    const std::vector<uint8_t>& target,
-    uint32_t initialNonceBase,
-    uint32_t& validNonce,
-    std::vector<uint8_t>& validHash,
-    std::vector<uint8_t>& sampleHashOut,
-    uint64_t& totalHashesTried)
-{
-    static MetalMiner* miner = nullptr;
-
-    if (!miner) {
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        NSError* err = nil;
-        id<MTLLibrary> lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:@"./build/mineKernel.metallib"]
-                                               error:&err];
-        if (!lib) {
-            logLine("[ERROR] Failed to load Metal library.");
-            return false;
-        }
-
-        miner = new MetalMiner(dev, lib, 131072);
-        miner->loadMidstateTailJSON("oracle/top_midstates.json");
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithFile:@"build/mineKernel.metallib" error:&error];
+    if (!library) {
+        std::cerr << "❌ Failed to load Metal library: " << error.localizedDescription.UTF8String << "\n";
+        return false;
     }
 
-    std::vector<uint8_t> targetLE(target.rbegin(), target.rend());
-    miner->setTarget(targetLE.data());
-    miner->setNonceBase(initialNonceBase);
+    id<MTLFunction> function = [library newFunctionWithName:@"mineMidstateSIMD2"];
+    if (!function) {
+        std::cerr << "❌ Failed to find Metal function 'mineMidstateSIMD2'.\n";
+        return false;
+    }
 
-    return miner->mine(validNonce, validHash, sampleHashOut, totalHashesTried);
+    id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) {
+        std::cerr << "❌ Failed to create pipeline: " << error.localizedDescription.UTF8String << "\n";
+        return false;
+    }
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    if (!queue) {
+        std::cerr << "❌ Failed to create command queue.\n";
+        return false;
+    }
+
+    // === Load midstates ===
+    std::vector<MidstateEntry> entries = loadMidstates("oracle/top_midstates.json");
+    if (entries.size() < 256) {
+        std::cerr << "❌ Need at least 256 midstate entries. Got " << entries.size() << "\n";
+        return false;
+    }
+
+    const size_t numThreads = 256;
+    std::vector<vector_uint2> midstateBuf(numThreads * 8);
+    std::vector<vector_uint2> tailBuf(numThreads);
+
+    for (size_t i = 0; i < numThreads; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            midstateBuf[i * 8 + j] = vector_uint2{entries[i].midstate[j], 0};
+        }
+        tailBuf[i] = vector_uint2{entries[i].tail, 0};
+    }
+
+    std::vector<vector_uint2> targetVec(8);
+    for (int i = 0; i < 8; ++i) {
+        targetVec[i] = vector_uint2{target[i], target[i]};
+    }
+
+    std::vector<vector_uint2> output(numThreads * 18, vector_uint2{0, 0});
+
+    id<MTLBuffer> midBuf = [device newBufferWithBytes:midstateBuf.data()
+                                               length:midstateBuf.size() * sizeof(vector_uint2)
+                                              options:MTLResourceStorageModeShared];
+
+    id<MTLBuffer> tailWordBuf = [device newBufferWithBytes:tailBuf.data()
+                                                    length:tailBuf.size() * sizeof(vector_uint2)
+                                                   options:MTLResourceStorageModeShared];
+
+    id<MTLBuffer> tgtBuf = [device newBufferWithBytes:targetVec.data()
+                                              length:targetVec.size() * sizeof(vector_uint2)
+                                             options:MTLResourceStorageModeShared];
+
+    id<MTLBuffer> outBuf = [device newBufferWithBytes:output.data()
+                                              length:output.size() * sizeof(vector_uint2)
+                                             options:MTLResourceStorageModeShared];
+
+    id<MTLBuffer> nonceBuf = [device newBufferWithLength:sizeof(uint32_t)
+                                                 options:MTLResourceStorageModeShared];
+
+    // ✅ Validate buffer creation
+    if (!midBuf || !tailWordBuf || !tgtBuf || !outBuf || !nonceBuf) {
+        std::cerr << "❌ One or more Metal buffers failed to allocate.\n";
+        return false;
+    }
+
+    *((uint32_t*)nonceBuf.contents) = initialNonceBase;
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+
+    // ✅ Add Metal error handler
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        if (cb.error) {
+            std::cerr << "⚠️ Metal error: " << cb.error.localizedDescription.UTF8String << std::endl;
+        }
+    }];
+
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:pipeline];
+
+    [enc setBuffer:midBuf offset:0 atIndex:0];
+    [enc setBuffer:tailWordBuf offset:0 atIndex:1];
+    [enc setBuffer:tgtBuf offset:0 atIndex:2];
+    [enc setBuffer:outBuf offset:0 atIndex:3];
+    [enc setBuffer:nonceBuf offset:0 atIndex:4];
+
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(numThreads, 1, 1)];
+    [enc endEncoding];
+
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    totalHashesTried = numThreads * 2;
+
+    // ✅ Safe GPU memory read
+    auto* result = (vector_uint2*)outBuf.contents;
+    if (!result) {
+        std::cerr << "❌ Failed to read GPU output buffer (nullptr).\n";
+        return false;
+    }
+
+    try {
+        for (size_t thread = 0; thread < numThreads; ++thread) {
+            for (int lane = 0; lane < 2; ++lane) {
+                int base = static_cast<int>(thread * 18 + lane * 9);
+                if (result[base].y == 1) {
+                    validIndex = static_cast<uint32_t>(thread);
+                    uint32_t nonce = result[base].x;
+
+                    validHash.resize(32);
+                    for (int i = 0; i < 8; ++i) {
+                        uint32_t h = result[base + 1 + i].x;
+                        validHash[i * 4 + 0] = (h >> 24) & 0xff;
+                        validHash[i * 4 + 1] = (h >> 16) & 0xff;
+                        validHash[i * 4 + 2] = (h >> 8) & 0xff;
+                        validHash[i * 4 + 3] = h & 0xff;
+                    }
+
+                    sampleHashOut = validHash;
+                    return true;
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "❌ Exception while reading Metal output: " << e.what() << std::endl;
+        return false;
+    } catch (...) {
+        std::cerr << "❌ Unknown fatal exception while reading Metal output.\n";
+        return false;
+    }
+
+    sampleHashOut.assign(32, 0);
+    return false;
 }

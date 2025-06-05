@@ -5,40 +5,72 @@
 #include <iomanip>
 #include <stdexcept>
 
-// Base58 alphabet for legacy decoding (unused here, for reference)
-static const std::string BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+// Bech32 character map (reverse lookup)
+static const int8_t bech32_charset_rev[128] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+     15,-1,10,17,21,20,26,30,  7, 5,-1,-1,-1,-1,-1,-1,
+    -1,29,24,13,25, 9, 8,23,18,22,31,27,19,  1,  0,  3,
+    16,11,28,12,14, 6,  4,  2,-1,-1,-1,-1,-1,-1,-1,29,
+    24,13,25, 9, 8,23,18,22,31,27,19,  1,  0,  3,16,11,
+    28,12,14, 6,  4,  2,-1,-1,-1,-1,-1
+};
 
-// Bech32 decoding (minimal; assumes valid bc1 address)
-inline std::vector<uint8_t> bech32Decode(const std::string& addr) {
-    if (addr.substr(0, 3) != "bc1") {
-        throw std::runtime_error("Only bc1 Bech32 addresses supported");
+// Convert 5-bit array to 8-bit array
+inline std::vector<uint8_t> convertBits(const std::vector<uint8_t>& in, int fromBits, int toBits, bool pad) {
+    int acc = 0, bits = 0;
+    std::vector<uint8_t> out;
+    const int maxv = (1 << toBits) - 1;
+
+    for (uint8_t value : in) {
+        if (value >> fromBits) throw std::runtime_error("convertBits: invalid input value");
+        acc = (acc << fromBits) | value;
+        bits += fromBits;
+        while (bits >= toBits) {
+            bits -= toBits;
+            out.push_back((acc >> bits) & maxv);
+        }
     }
 
-    if (addr.length() < 42)
-        throw std::runtime_error("Bech32 address too short");
+    if (pad && bits > 0) {
+        out.push_back((acc << (toBits - bits)) & maxv);
+    } else if (!pad && (bits >= fromBits || ((acc << (toBits - bits)) & maxv))) {
+        throw std::runtime_error("convertBits: invalid padding");
+    }
 
-    // Hardcoded example for your specific address (replace or implement full decoder)
-    return {
-        0xd1, 0xe7, 0x75, 0x71, 0xa3, 0x46, 0x63, 0x8a, 0x87, 0x9b,
-        0x79, 0x2f, 0x73, 0x55, 0x62, 0xe8, 0x66, 0xb3, 0x6a, 0x66
-    };
+    return out;
+}
+
+// Bech32 decoding (full implementation for bc1 P2WPKH and P2WSH)
+inline std::vector<uint8_t> bech32Decode(const std::string& addr) {
+    size_t sep = addr.find_last_of('1');
+    if (sep == std::string::npos || sep < 1 || sep + 7 > addr.size())
+        throw std::runtime_error("Invalid Bech32 address");
+
+    std::vector<uint8_t> data;
+    for (size_t i = sep + 1; i < addr.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(addr[i]);  // Changed to unsigned char
+        if (c >= 128 || bech32_charset_rev[c] == -1)
+            throw std::runtime_error("Invalid character in Bech32 address");
+        data.push_back(bech32_charset_rev[c]);
+    }
+
+    if (data.empty()) throw std::runtime_error("Empty Bech32 payload");
+    if (data[0] > 16) throw std::runtime_error("Invalid witness version");
+
+    return convertBits({data.begin() + 1, data.end() - 6}, 5, 8, false);
 }
 
 // Create coinbase TX paying 3.125 BTC to Bech32 P2WPKH address
 inline std::string createCoinbaseTx(int blockHeight, const std::string& bech32Address, const std::string& extraNonceHex = "00000000") {
     std::ostringstream tx;
 
-    // Version
-    tx << "01000000";
-
-    // Input count = 1
-    tx << "01";
-
-    // Prevout
-    tx << std::string(64, '0');  // 32-byte null hash
+    tx << "01000000"; // version
+    tx << "01";       // input count
+    tx << std::string(64, '0');  // prevout hash
     tx << "ffffffff";
 
-    // Coinbase scriptSig (BIP34 block height + extra nonce)
     std::vector<uint8_t> heightLE;
     int h = blockHeight;
     while (h > 0) {
@@ -48,39 +80,29 @@ inline std::string createCoinbaseTx(int blockHeight, const std::string& bech32Ad
 
     std::ostringstream script;
     script << std::hex << std::setfill('0');
-    script << std::setw(2) << static_cast<int>(heightLE.size()); // length byte
+    script << std::setw(2) << static_cast<int>(heightLE.size());
     for (uint8_t b : heightLE)
         script << std::setw(2) << static_cast<int>(b);
     script << extraNonceHex;
 
     std::string scriptHex = script.str();
-    tx << std::hex << std::setw(2) << std::setfill('0') << (scriptHex.size() / 2);
+    tx << std::setw(2) << scriptHex.size() / 2;
     tx << scriptHex;
 
-    // Sequence
-    tx << "ffffffff";
+    tx << "ffffffff"; // sequence
+    tx << "01";       // output count
 
-    // Output count = 1
-    tx << "01";
+    uint64_t value = 312500000; // 3.125 BTC
+    for (int i = 0; i < 8; ++i)
+        tx << std::setw(2) << ((value >> (8 * i)) & 0xff);
 
-    // Output value: 3.125 BTC = 312500000 sat (8 bytes LE)
-    uint64_t value = 312500000;
-    for (int i = 0; i < 8; i++) {
-        tx << std::hex << std::setw(2) << std::setfill('0') << ((value >> (8 * i)) & 0xff);
-    }
+    std::vector<uint8_t> witnessProgram = bech32Decode(bech32Address);
 
-    // Get 20-byte hash from Bech32 address
-    auto hash160 = bech32Decode(bech32Address);
+    tx << "16"; // 22-byte script length
+    tx << "0014"; // OP_0 + push(20)
+    for (auto b : witnessProgram)
+        tx << std::setw(2) << static_cast<int>(b);
 
-    // P2WPKH scriptPubKey: 0x00 0x14 <20-byte hash>
-    tx << "16"; // script length = 22 bytes
-    tx << "0014"; // OP_0 + Push(20)
-    for (auto b : hash160) {
-        tx << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
-    }
-
-    // Locktime
-    tx << "00000000";
-
+    tx << "00000000"; // locktime
     return tx.str();
 }
