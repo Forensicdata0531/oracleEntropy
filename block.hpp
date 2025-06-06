@@ -3,8 +3,8 @@
 #include <cstdint>
 #include <vector>
 #include <array>
+#include <simd/simd.h>
 
-// Convert compact bits field (Bitcoin format) into a 32-byte target hash (big-endian)
 inline std::vector<uint8_t> bitsToTarget(uint32_t bits) {
     uint32_t exponent = bits >> 24;
     uint32_t mantissa = bits & 0x007fffff;
@@ -25,7 +25,6 @@ inline std::vector<uint8_t> bitsToTarget(uint32_t bits) {
     return target;
 }
 
-// Block header structure — 80 bytes when serialized
 struct BlockHeader {
     uint32_t version;
     std::array<uint8_t, 32> prevBlockHash;
@@ -34,31 +33,11 @@ struct BlockHeader {
     uint32_t bits;
     uint32_t nonce;
 
-    // Returns the 80-byte serialized block header in little-endian format with hashes reversed
-    std::vector<uint8_t> toBytes() const {
-        std::vector<uint8_t> bytes;
+    std::vector<uint8_t> toBytes() const;
 
-        auto appendLE32 = [&](uint32_t val) {
-            bytes.push_back(static_cast<uint8_t>(val & 0xff));
-            bytes.push_back(static_cast<uint8_t>((val >> 8) & 0xff));
-            bytes.push_back(static_cast<uint8_t>((val >> 16) & 0xff));
-            bytes.push_back(static_cast<uint8_t>((val >> 24) & 0xff));
-        };
+    // Returns vector<uint32_t> representing the 8 32-bit words of midstate
+    std::vector<uint32_t> getMidstateWords() const;
 
-        auto appendReversed = [&](const std::array<uint8_t, 32>& arr) {
-            // Bitcoin serializes hashes as little-endian, so reverse bytes before appending
-            for (int i = 31; i >= 0; --i) {
-                bytes.push_back(arr[i]);
-            }
-        };
-
-        appendLE32(version);
-        appendReversed(prevBlockHash);
-        appendReversed(merkleRoot);
-        appendLE32(timestamp);
-        appendLE32(bits);
-        appendLE32(nonce);
-
-        return bytes;
-    }
+    // Returns the last 8 bytes (tail words) packed as simd::uint2 (two uint32_t)
+    simd::uint2 getTailWords() const;
 };
