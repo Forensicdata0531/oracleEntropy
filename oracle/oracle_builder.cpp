@@ -29,7 +29,7 @@ int main() {
     inFile >> headers_json;
     std::cout << "Loaded " << headers_json.size() << " entries from block_headers.json\n";
 
-    json output_json = json::array();  // Initialize explicitly as array
+    json output_json = json::array();  // Initialize as JSON array
 
     for (const auto& entry : headers_json) {
         if (!entry.contains("header_hex")) {
@@ -45,7 +45,21 @@ int main() {
         std::string blockhash = entry["hash"];
 
         std::vector<uint8_t> raw = hex_to_bytes(hex_header);
-        std::string midstate_hex = compute_sha256_midstate_hex(raw.data(), raw.size());
+        if (raw.size() < 64) {
+            std::cerr << "⚠️ Skipping entry with header size less than 64 bytes\n";
+            continue;
+        }
+
+        // ✅ Use only the first 64 bytes of the 80-byte block header
+        std::vector<uint8_t> first64(raw.begin(), raw.begin() + 64);
+
+        std::string midstate_hex;
+        try {
+            midstate_hex = compute_sha256_midstate_hex(first64.data(), first64.size());
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Error computing midstate: " << e.what() << "\n";
+            continue;
+        }
 
         output_json.push_back({
             {"blockhash", blockhash},

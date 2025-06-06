@@ -25,8 +25,6 @@ $CXX    $BASE_CXXFLAGS -c utils.cpp             -o build/utils.o
 $CXX    $BASE_CXXFLAGS -c rpc.cpp               -o build/rpc.o
 $CXX    $BASE_CXXFLAGS -c sha256_compress.cpp   -o build/sha256_compress.o
 $CXX    $BASE_CXXFLAGS -c block_utils.cpp       -o build/block_utils.o
-
-# Compile midstate.cpp — added this line to your build!
 $CXX    $BASE_CXXFLAGS -c midstate.cpp          -o build/midstate.o
 
 $OBJCXX $BASE_CXXFLAGS -ObjC++ -c metal_miner.mm -o build/metal_miner.o
@@ -60,4 +58,10 @@ echo "✅ build_midstates built successfully."
 echo "🚀 Running mining pipeline..."
 ./oracle/oracle_dispatcher 2> >(grep -v "Context leak detected" >&2)
 ./oracle/build_midstates    2> >(grep -v "Context leak detected" >&2)
+
+echo "🔄 Deduplicating top_midstates.json..."
+jq 'unique_by(.midstate)' oracle/top_midstates.json > oracle/top_midstates_unique.json
+mv oracle/top_midstates_unique.json oracle/top_midstates.json
+echo "✅ Deduplication complete. Unique midstates count: $(jq length oracle/top_midstates.json)"
+
 ./MetalMiner                2> >(grep -v "Context leak detected" >&2)

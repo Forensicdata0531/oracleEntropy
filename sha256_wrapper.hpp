@@ -6,8 +6,8 @@
 // Compute full SHA-256 hash
 std::vector<uint8_t> sha256(const std::vector<uint8_t>& data);
 
-// Optional: return midstate (internal state after first 64 rounds)
+// Get SHA-256 midstate as 8-word vector
 std::vector<uint32_t> sha256_midstate(const std::vector<uint8_t>& header);
 
-// ✅ FIXED declaration: accepts raw bytes
+// Get midstate as hex string (8 words, 32 bytes total, big-endian)
 std::string compute_sha256_midstate_hex(const uint8_t* data, size_t len);
